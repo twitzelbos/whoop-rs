@@ -95,6 +95,7 @@ poop scan                              # what is in range
 poop info --family 5                   # identity, battery, clock, range
 poop stream --realtime --duration 60   # live traffic
 poop history --out tonight.ndjson      # offload the ring buffer
+poop history --no-ack --out peek.ndjson # preview it; the strap keeps everything
 poop buzz                              # confirm which strap this is
 
 poop config flags                      # walk the feature-flag names
@@ -128,6 +129,20 @@ newest     1760230740 (in step with this host)
 
 `RUST_LOG=debug` adds BLE-level diagnostics on stderr. The TUI writes its logs
 to `poop-tui.log` instead, so they cannot corrupt the display.
+
+### Next to the WHOOP app
+
+A strap has one WHOOP-service connection, and while the WHOOP app holds it the
+strap is invisible to `scan`. To use poop without giving that up:
+
+- **`poop history --no-ack`**: a plain `history` acknowledges every stored
+  chunk, and an acknowledged chunk is one the strap may discard, so those
+  records may never reach the WHOOP app. `--no-ack` stores chunks without
+  acknowledging any. The strap only moves on after an acknowledgement, so this
+  gets the first chunk (about 50 records) and stops when the strap starts
+  repeating itself: a preview, not a backlog. The WHOOP app still syncs
+  everything afterwards. It needs the WHOOP-service connection, so take turns:
+  phone Bluetooth off, run it, phone Bluetooth back on.
 
 Destructive commands are not reachable from the CLI at all. Configuration
 writes need `--allow-writes`, ECG commands need `--allow-ecg` plus MG hardware,

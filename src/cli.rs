@@ -51,6 +51,9 @@ struct Args {
     allow_writes: bool,
     /// Permit the MG ECG command family.
     allow_ecg: bool,
+    /// `history`: store chunks but never acknowledge them, so the strap keeps
+    /// everything for the WHOOP app.
+    no_ack: bool,
     /// Positional argument for the subcommands that take one.
     arg: Option<String>,
     /// Second positional argument — a key, an ID, an epoch.
@@ -122,6 +125,10 @@ OPTIONS:
         --simulate           Drive a simulated strap; no hardware needed
         --allow-writes       Permit configuration writes
         --allow-ecg          Permit the MG ECG command family
+        --no-ack             history: store chunks but never acknowledge them, so
+                             the strap keeps every record for the WHOOP app. The
+                             strap moves on only after an acknowledgement, so this
+                             gets a preview (the first chunk or so), not a backlog
     -h, --help               Show this help
 
 EXAMPLES:
@@ -129,6 +136,7 @@ EXAMPLES:
     poop info --family 5
     poop stream --simulate --duration 30
     poop history --simulate --out demo.ndjson
+    poop history --no-ack --out peek.ndjson
     poop config flags
     poop config get cont_collection_mode
     poop alarm set 1760230800000
@@ -137,6 +145,10 @@ NOTES:
     Destructive commands are not reachable from this CLI at all. Configuration
     writes and ECG commands need their flags above, and `probe reboot` restarts
     the strap, interrupting anything in flight.
+
+    `history` acknowledges each chunk after storing it, and an acknowledged
+    chunk is one the strap may discard: those records may then never reach the
+    WHOOP app. Use --no-ack if the WHOOP app should still get everything.
 
     --simulate runs the real decoders over generated frames. Nothing it reports
     is a measurement.
@@ -160,6 +172,7 @@ fn parse_args() -> Result<Args> {
         simulate: false,
         allow_writes: false,
         allow_ecg: false,
+        no_ack: false,
         arg: None,
         value: None,
         extra: None,
@@ -220,6 +233,7 @@ fn parse_args() -> Result<Args> {
             "--simulate" => parsed.simulate = true,
             "--allow-writes" => parsed.allow_writes = true,
             "--allow-ecg" => parsed.allow_ecg = true,
+            "--no-ack" => parsed.no_ack = true,
             // Positionals, which only the subcommands use. Collected in order
             // rather than by name, because `config set KEY VALUE` is the one
             // shape that needs two and naming them would be worse to type.
@@ -600,6 +614,9 @@ async fn cmd_history(args: &Args) -> Result<()> {
 
     let mut chunks = 0u64;
     let mut written = 0u64;
+    // --no-ack: the trim cursor of the last chunk stored, to notice the strap
+    // repeating itself while it waits for an acknowledgement.
+    let mut last_cursor: Option<u32> = None;
     // The idle watchdog's anchor. Advanced only by offload progress — not by
     // every arriving event — because the standard Heart Rate Service notifies
     // about once a second whether or not history is moving, and a deadline
@@ -629,8 +646,18 @@ async fn cmd_history(args: &Args) -> Result<()> {
         match session.feed(&next) {
             Step::Started => println!("stream started"),
             Step::Chunk(chunk) => {
-                chunks += 1;
                 let count = chunk.len();
+                if args.no_ack {
+                    // Without acknowledgements the strap does not move on: it
+                    // repeats end markers (empty, or the same chunk again). Stop
+                    // before storing a repeat, so the file has no duplicates.
+                    let repeat = chunk.trim_cursor.is_some() && chunk.trim_cursor == last_cursor;
+                    if count == 0 || repeat {
+                        break Ok("the strap is waiting for an acknowledgement (--no-ack)");
+                    }
+                    last_cursor = chunk.trim_cursor;
+                }
+                chunks += 1;
 
                 // ── 1 and 2: durable, or no acknowledgement ────────────────
                 if let Err(e) = out.write_chunk(&chunk) {
@@ -642,6 +669,14 @@ async fn cmd_history(args: &Args) -> Result<()> {
                 written += count as u64;
 
                 // ── 3: the token, now that the chunk is on disk ────────────
+                if args.no_ack {
+                    // Never acknowledged: the strap may not discard anything,
+                    // and keeps every record for the WHOOP app's next sync.
+                    println!(
+                        "chunk {chunks}: {count} record(s) stored, not acknowledged (--no-ack)"
+                    );
+                    continue;
+                }
                 match chunk.committed() {
                     Some(ack) => {
                         handle.ack_history(&ack).await?;
@@ -662,6 +697,11 @@ async fn cmd_history(args: &Args) -> Result<()> {
         }
     };
 
+    if args.no_ack {
+        // The strap waits for an acknowledgement that will not come; tell it the
+        // offload is over rather than leave it mid-transfer.
+        let _ = handle.abort_history().await;
+    }
     let rejected = out.rejected();
     out.finish()?;
     let reason = match outcome {
@@ -702,6 +742,12 @@ async fn cmd_history(args: &Args) -> Result<()> {
     // which is why this is an `if let` rather than an unwrap.
     if let Ok(range) = handle.data_range().await {
         println!("{} page(s) still behind on the strap", range.pages_behind());
+    }
+    if args.no_ack {
+        println!(
+            "nothing was acknowledged: the strap keeps all of it, and the offload stops \
+             where it waited for the first acknowledgement"
+        );
     }
     if handle.is_simulated() {
         println!("this was a simulated strap — none of it is a measurement");

@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — noting
 that in the `0.0.x` range Cargo treats every release as incompatible with every
 other, so a patch bump here is not a compatible upgrade.
 
+## [Unreleased] — fork twitzelbos/whoop-rs
+
+### Added
+
+- **`poop history --no-ack`**: store history chunks without acknowledging them,
+  so the strap keeps every record for the WHOOP app. Stops when the strap waits
+  for an acknowledgement (an empty or repeated chunk), before writing a repeat,
+  and ends the offload on the strap.
+
 ## [0.0.2] — 2026-10-15
 
 ### Changed
