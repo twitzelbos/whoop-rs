@@ -417,6 +417,84 @@ impl WhoopClient {
         Ok(found)
     }
 
+    /// Find straps through the standard Heart Rate service instead of a WHOOP
+    /// custom service.
+    ///
+    /// A strap whose WHOOP-service connection is held by the phone app does not
+    /// advertise that service, so [`Self::scan_all`] cannot see it. With WHOOP's
+    /// *Broadcast Heart Rate* on, it still advertises `180D`. Each sighting whose
+    /// name starts with the configured prefix (default `WHOOP`) is adopted with
+    /// the full WHOOP grant, so [`Self::connect_to`] can then ask the strap for
+    /// its custom service, which it may or may not offer to a second client.
+    ///
+    /// The advertisement says nothing about the generation: it comes from
+    /// `config.family`, else the name (`WHOOP 4…` is a 4.0, anything else is
+    /// taken as 5.0/MG), and is confirmed against the strap's services when
+    /// connecting.
+    pub async fn scan_heart_rate_broadcast(&self) -> Result<Vec<WhoopDevice>> {
+        let bluetooth = Bluetooth::shared();
+        bluetooth
+            .availability()
+            .await
+            .context("Bluetooth is not usable")?;
+        let prefix = self
+            .config
+            .name_prefix
+            .clone()
+            .unwrap_or_else(|| "WHOOP".to_owned());
+        info!(
+            "scan_heart_rate_broadcast: scanning for {} s …",
+            self.config.scan_timeout_secs
+        );
+        let mut scan = bluetooth
+            .request_le_scan(
+                LeScanOptions::new().filter(
+                    DeviceFilter::new()
+                        .service(HEART_RATE_SERVICE)?
+                        .name_prefix(prefix),
+                ),
+            )
+            .await?;
+        let mut seen: BTreeMap<String, Candidate> = BTreeMap::new();
+        let window = Duration::from_secs(self.config.scan_timeout_secs);
+        let _ = platform::timeout(window, async {
+            while let Some(candidate) = scan.next().await {
+                seen.insert(candidate.id.clone(), candidate);
+            }
+        })
+        .await;
+        scan.stop();
+
+        let mut found = Vec::new();
+        for (id, candidate) in seen {
+            let name = candidate.label().to_owned();
+            let family = self
+                .config
+                .family
+                .unwrap_or(if name.starts_with("WHOOP 4") {
+                    DeviceFamily::Whoop4
+                } else {
+                    DeviceFamily::Whoop5
+                });
+            match bluetooth
+                .adopt_candidate(&candidate, whoop_grant(Some(family))?)
+                .await
+            {
+                Ok(device) => found.push(WhoopDevice {
+                    name,
+                    id,
+                    family,
+                    device,
+                }),
+                Err(e) => {
+                    warn!("scan_heart_rate_broadcast: {name} ({id}) could not be adopted: {e}")
+                }
+            }
+        }
+        info!("scan_heart_rate_broadcast: {} strap(s) found", found.len());
+        Ok(found)
+    }
+
     /// Connect to a strap from [`Self::scan_all`], subscribe, and start the
     /// dispatch task.
     pub async fn connect_to(

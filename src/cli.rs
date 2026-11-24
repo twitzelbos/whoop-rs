@@ -54,6 +54,9 @@ struct Args {
     /// `history`: store chunks but never acknowledge them, so the strap keeps
     /// everything for the WHOOP app.
     no_ack: bool,
+    /// Find the strap through its standard Heart Rate broadcast (WHOOP's
+    /// "Broadcast Heart Rate"), not through a WHOOP custom service.
+    via_hr: bool,
     /// Positional argument for the subcommands that take one.
     arg: Option<String>,
     /// Second positional argument — a key, an ID, an epoch.
@@ -129,6 +132,9 @@ OPTIONS:
                              the strap keeps every record for the WHOOP app. The
                              strap moves on only after an acknowledgement, so this
                              gets a preview (the first chunk or so), not a backlog
+        --via-hr             Find the strap through its standard Heart Rate
+                             broadcast ('Broadcast Heart Rate' in the WHOOP app),
+                             for when the phone holds the WHOOP-service connection
     -h, --help               Show this help
 
 EXAMPLES:
@@ -173,6 +179,7 @@ fn parse_args() -> Result<Args> {
         allow_writes: false,
         allow_ecg: false,
         no_ack: false,
+        via_hr: false,
         arg: None,
         value: None,
         extra: None,
@@ -234,6 +241,7 @@ fn parse_args() -> Result<Args> {
             "--allow-writes" => parsed.allow_writes = true,
             "--allow-ecg" => parsed.allow_ecg = true,
             "--no-ack" => parsed.no_ack = true,
+            "--via-hr" => parsed.via_hr = true,
             // Positionals, which only the subcommands use. Collected in order
             // rather than by name, because `config set KEY VALUE` is the one
             // shape that needs two and naming them would be worse to type.
@@ -287,11 +295,20 @@ fn config(args: &Args) -> WhoopClientConfig {
 /// id there is a per-host UUID nobody memorises.
 async fn pick(args: &Args) -> Result<WhoopDevice> {
     let client = WhoopClient::new(config(args));
-    let found = client.scan_all().await?;
+    let found = if args.via_hr {
+        client.scan_heart_rate_broadcast().await?
+    } else {
+        client.scan_all().await?
+    };
     if found.is_empty() {
         return Err(anyhow!(
-            "no WHOOP strap found in {} s — is it on your wrist and awake?",
-            args.scan_secs
+            "no WHOOP strap found in {} s — is it on your wrist and awake?{}",
+            args.scan_secs,
+            if args.via_hr {
+                " With --via-hr, 'Broadcast Heart Rate' must be on in the WHOOP app."
+            } else {
+                ""
+            }
         ));
     }
     match &args.select {
