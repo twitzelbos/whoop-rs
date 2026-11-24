@@ -3,6 +3,9 @@
 //! Four subcommands, in the order you would use them: `scan` to see what is in
 //! range, `info` to connect and read the strap's own view of itself, `stream`
 //! to watch live traffic, and `history` to offload the ring buffer to a file.
+//! `hr` is the odd one out: it reads only the standard Heart Rate service, the
+//! one a strap in WHOOP's "Broadcast Heart Rate" mode offers to a second device
+//! while the WHOOP app keeps its own connection.
 //!
 //! `history` is where the interesting rule lives. It writes each chunk to
 //! NDJSON and calls `fsync` **before** acknowledging it, because an
@@ -69,6 +72,7 @@ enum Command {
     Config,
     Alarm,
     Probe,
+    Hr,
 }
 
 const USAGE: &str = "\
@@ -83,6 +87,8 @@ COMMANDS:
     stream               Print live traffic until interrupted
     history              Offload the strap's stored records to an NDJSON file
     buzz                 Buzz the strap, to confirm you have the right one
+    hr                   Live heart rate over the standard Heart Rate service only:
+                         works next to the WHOOP app when 'Broadcast Heart Rate' is on
     config <SUB>         Named configuration — see CONFIG below
     alarm <SUB>          Alarms — see ALARM below
     probe <SUB>          Read-only diagnostics — see PROBE below
@@ -129,6 +135,7 @@ EXAMPLES:
     poop info --family 5
     poop stream --simulate --duration 30
     poop history --simulate --out demo.ndjson
+    poop hr --duration 60
     poop config flags
     poop config get cont_collection_mode
     poop alarm set 1760230800000
@@ -137,6 +144,11 @@ NOTES:
     Destructive commands are not reachable from this CLI at all. Configuration
     writes and ECG commands need their flags above, and `probe reboot` restarts
     the strap, interrupting anything in flight.
+
+    `hr` needs 'Broadcast Heart Rate' on in the WHOOP app (Device Settings). It
+    connects unbonded and reads bpm only; broadcast mode sends no R-R intervals.
+    It considers only devices whose name starts with 'WHOOP' unless --name is
+    given.
 
     --simulate runs the real decoders over generated frames. Nothing it reports
     is a measurement.
@@ -175,6 +187,7 @@ fn parse_args() -> Result<Args> {
             "config" => command = Some(Command::Config),
             "alarm" => command = Some(Command::Alarm),
             "probe" => command = Some(Command::Probe),
+            "hr" => command = Some(Command::Hr),
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -239,7 +252,7 @@ fn parse_args() -> Result<Args> {
     }
 
     parsed.command = command.ok_or_else(|| {
-        anyhow!("no command given; try one of scan, info, stream, history, buzz, or --help")
+        anyhow!("no command given; try one of scan, info, stream, history, buzz, hr, or --help")
     })?;
     Ok(parsed)
 }
@@ -711,6 +724,116 @@ async fn cmd_history(args: &Args) -> Result<()> {
     Ok(())
 }
 
+// ── hr ────────────────────────────────────────────────────────────────────────
+
+/// Live heart rate over the standard Heart Rate service and nothing else.
+///
+/// No WHOOP service, no handshake, no bonding: this is what a gym bike sees of
+/// a strap in "Broadcast Heart Rate" mode, and it leaves the WHOOP app's own
+/// connection alone. Broadcast mode advertises `180D` even while the phone is
+/// connected, which the WHOOP-service scan in `scan` never matches.
+async fn cmd_hr(args: &Args) -> Result<()> {
+    use webbluetooth::stream::StreamExt;
+    use webbluetooth::uuid::{characteristics, services};
+    use webbluetooth::{Bluetooth, DeviceFilter, Grant, LeScanOptions};
+
+    if args.simulate {
+        return Err(anyhow!(
+            "hr has no simulated mode; try `poop stream --simulate`"
+        ));
+    }
+    let prefix = args
+        .name_prefix
+        .clone()
+        .unwrap_or_else(|| "WHOOP".to_owned());
+    let bluetooth = Bluetooth::shared();
+    bluetooth
+        .availability()
+        .await
+        .map_err(|e| anyhow!("Bluetooth is not usable: {e}"))?;
+    let mut scan = bluetooth
+        .request_le_scan(
+            LeScanOptions::new().filter(
+                DeviceFilter::new()
+                    .service(services::HEART_RATE)?
+                    .name_prefix(prefix.clone()),
+            ),
+        )
+        .await?;
+    let needle = args.select.as_ref().map(|s| s.to_lowercase());
+    let window = Duration::from_secs(args.scan_secs);
+    let found = tokio::time::timeout(window, async {
+        while let Some(c) = scan.next().await {
+            let matches = needle.as_ref().is_none_or(|n| {
+                c.label().to_lowercase().contains(n) || c.id.to_lowercase().contains(n)
+            });
+            if matches {
+                return Some(c);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    scan.stop();
+    let Some(candidate) = found else {
+        return Err(anyhow!(
+            "no heart-rate broadcast from a device named {prefix}… in {} s — is \
+             \"Broadcast Heart Rate\" on in the WHOOP app (Device Settings)?",
+            args.scan_secs
+        ));
+    };
+
+    let device = bluetooth
+        .adopt_candidate(&candidate, Grant::new().service(services::HEART_RATE)?)
+        .await?;
+    let gatt = device.gatt();
+    gatt.connect().await?;
+    println!("linked  {} (standard Heart Rate only)", candidate.label());
+    let measurement = gatt
+        .get_primary_service(services::HEART_RATE)
+        .await?
+        .get_characteristic(characteristics::HEART_RATE_MEASUREMENT)
+        .await?;
+    let mut beats = measurement.start_notifications().await?;
+    println!("streaming — Ctrl-C to stop\n");
+
+    let pump = async {
+        while let Some(value) = beats.next().await {
+            match poop::parse::hr_measurement(&value) {
+                Some(hr) => {
+                    let rr = if hr.rr_ms.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  rr {:?} ms", hr.rr_ms)
+                    };
+                    println!("hr      {:>3} bpm{rr}", hr.bpm);
+                }
+                None => println!("bad     heart-rate value, {} bytes", value.len()),
+            }
+        }
+    };
+    match args.duration {
+        Some(secs) => {
+            if tokio::time::timeout(Duration::from_secs(secs), pump)
+                .await
+                .is_ok()
+            {
+                println!("\nthe strap stopped sending");
+            } else {
+                println!("\nstopped after {secs} s");
+            }
+        }
+        None => {
+            pump.await;
+            println!("\nthe strap stopped sending");
+        }
+    }
+    gatt.disconnect();
+    Ok(())
+}
+
 // ── buzz ──────────────────────────────────────────────────────────────────────
 
 async fn cmd_buzz(args: &Args) -> Result<()> {
@@ -1040,6 +1163,7 @@ pub async fn run() -> Result<()> {
         Command::Stream => cmd_stream(&args).await,
         Command::History => cmd_history(&args).await,
         Command::Buzz => cmd_buzz(&args).await,
+        Command::Hr => cmd_hr(&args).await,
         Command::Config => cmd_config(&args).await,
         Command::Alarm => cmd_alarm(&args).await,
         Command::Probe => cmd_probe(&args).await,

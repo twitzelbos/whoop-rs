@@ -96,6 +96,7 @@ poop info --family 5                   # identity, battery, clock, range
 poop stream --realtime --duration 60   # live traffic
 poop history --out tonight.ndjson      # offload the ring buffer
 poop buzz                              # confirm which strap this is
+poop hr --duration 60                  # live bpm next to the WHOOP app (Broadcast Heart Rate)
 
 poop config flags                      # walk the feature-flag names
 poop config get cont_collection_mode   # read one named value
@@ -128,6 +129,19 @@ newest     1760230740 (in step with this host)
 
 `RUST_LOG=debug` adds BLE-level diagnostics on stderr. The TUI writes its logs
 to `poop-tui.log` instead, so they cannot corrupt the display.
+
+### Next to the WHOOP app
+
+A strap has one WHOOP-service connection, and while the WHOOP app holds it the
+strap is invisible to `scan`. To use poop without giving that up:
+
+- **`poop hr`**: turn on *Broadcast Heart Rate* in the WHOOP app (Device
+  Settings). The strap then also advertises the standard Heart Rate service
+  (`180D`) and accepted an unbonded second connection for it, with the phone
+  still connected (tested on a WHOOP 5.0/MG; that the app's own connection stays
+  up throughout is not yet confirmed). `poop hr` scans for that service (devices named `WHOOP…`, or
+  `--name`), connects with nothing else granted, and prints bpm. Broadcast mode
+  sends no R-R intervals, so there is no HRV from this.
 
 Destructive commands are not reachable from the CLI at all. Configuration
 writes need `--allow-writes`, ECG commands need `--allow-ecg` plus MG hardware,

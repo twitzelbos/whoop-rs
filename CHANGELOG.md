@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — noting
 that in the `0.0.x` range Cargo treats every release as incompatible with every
 other, so a patch bump here is not a compatible upgrade.
 
+## [Unreleased] — fork twitzelbos/whoop-rs
+
+### Added
+
+- **`poop hr`**: live heart rate over the standard Heart Rate service only, for
+  a strap in WHOOP's *Broadcast Heart Rate* mode. It works while the WHOOP app
+  stays connected: no WHOOP service, no handshake, no bonding.
+
 ## [0.0.2] — 2026-10-15
 
 ### Changed
